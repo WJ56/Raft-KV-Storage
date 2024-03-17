@@ -1,6 +1,9 @@
 package kvraft
 
-import "6.5840/porcupine"
+import (
+	"6.5840/porcupine"
+	"log"
+)
 import "6.5840/models"
 import "testing"
 import "strconv"
@@ -418,7 +421,7 @@ func GenericTestSpeed(t *testing.T, part string, maxraftstate int) {
 	if dur > numOps*timePerOp {
 		t.Fatalf("Operations completed too slowly %v/op > %v/op\n", dur/numOps, timePerOp)
 	}
-
+	log.Printf("Operations completed is %v/op \n", dur/numOps)
 	cfg.end()
 }
 
