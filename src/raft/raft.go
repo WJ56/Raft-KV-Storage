@@ -323,6 +323,7 @@ type RequestVoteArgs struct {
 	CandidateId  int // candidate requesting vote
 	LastLogIndex int // index of candidate’s last log entry (§5.4)
 	LastLogTerm  int // term of candidate’s last log entry (§5.4)
+	IsPreVote    bool
 }
 
 // example RequestVote RPC reply structure.
@@ -353,31 +354,36 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		return
 	}
-	f := false
+	updateTimeout := false
 	if args.Term > rf.currentTerm {
 		//fmt.Println("args.Term > rf.currentTerm : ", args.Term, rf.currentTerm)
 		rf.currentTerm = args.Term
 		rf.state = follower
-		f = true
+		updateTimeout = true
 		rf.votedFor = -1
 		rf.persist()
 	}
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	// TODO：这里很重要：预选举中，可以在一个任期中同时投多票。正式选举中，才只能投一票。
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId || args.IsPreVote {
 		lastLogIndex := rf.log[len(rf.log)-1].Index
 		lastLogTerm := rf.log[len(rf.log)-1].Term
 		// 判断候选者的日志是否至少和自己的一样新
 		if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 			// 可以投票
 			//fmt.Println(rf.me, "可以投票", args.CandidateId)
-			rf.votedFor = args.CandidateId
-			rf.persist()
+			// Debug(dVote, "S%d vote S%d, isPre?:%d ", rf.me, args.CandidateId, args.IsPreVote)
+			if args.IsPreVote == false {
+				// Not Pre_Vote
+				rf.votedFor = args.CandidateId
+				rf.persist()
+				updateTimeout = true
+			}
 			reply.VoteGranted = true
 			reply.Term = args.Term
-			f = true
 			// Debug(dVote, "S%d vote S%d's term %d Lterm %d Lindex %d", rf.me, args.CandidateId, args.Term, args.LastLogTerm, args.LastLogIndex)
 		}
 	}
-	if f == true {
+	if updateTimeout == true {
 		rf.timeNow = time.Now()
 		rf.timeout = time.Duration(250+(rand.Int63()%250)) * time.Millisecond
 	}
@@ -421,20 +427,29 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			//fmt.Println("reply.Term > rf.currentTerm")
 			rf.currentTerm = reply.Term
 			rf.reset()
-			rf.persist()
 			return ok
-		} else if rf.state == candidate && reply.VoteGranted == true && reply.Term == rf.currentTerm {
-			rf.voteCount++
-			// Debug(dVote, "S%d receive S%d's vote", rf.me, server)
-			if rf.voteCount > len(rf.peers)/2 {
-				// Todo : 选举为leader后，需要做的事
-				// Debug(dVote, "S%d receive most votes, become leader", rf.me)
-				rf.state = leader
-				for i := range rf.peers {
-					rf.nextIndex[i] = rf.log[len(rf.log)-1].Index + 1
-					rf.matchIndex[i] = 0
+		}
+		if reply.VoteGranted == true && reply.Term == rf.currentTerm {
+			if (rf.state == follower && args.IsPreVote == true) || (rf.state == candidate && args.IsPreVote == false) {
+				// Debug(dVote, "S%d got S%d's vote， isPre?:%d ", rf.me, server, args.IsPreVote)
+				rf.voteCount++
+				if rf.voteCount > len(rf.peers)/2 {
+					if args.IsPreVote {
+						// Pre_Vote
+						// Debug(dVote, "S%d receive most votes, Insert Formal_Vote", rf.me)
+						rf.state = candidate
+						rf.vote(false)
+					} else {
+						// Todo : 选举为leader后，需要做的事
+						// Debug(dVote, "S%d receive most votes, become leader", rf.me)
+						rf.state = leader
+						for i := range rf.peers {
+							rf.nextIndex[i] = rf.log[len(rf.log)-1].Index + 1
+							rf.matchIndex[i] = 0
+						}
+						go rf.append()
+					}
 				}
-				go rf.append()
 			}
 		}
 	}
@@ -739,6 +754,7 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) reset() {
 	rf.state = follower
 	rf.votedFor = -1
+	rf.voteCount = 0
 	rf.persist()
 	rf.timeNow = time.Now()
 	rf.timeout = time.Duration(250+(rand.Int63()%250)) * time.Millisecond
@@ -791,6 +807,30 @@ func (rf *Raft) append() {
 	}
 }
 
+func (rf *Raft) vote(isPreVote bool) {
+	rf.timeNow = time.Now()
+	rf.timeout = time.Duration(250+(rand.Int63()%250)) * time.Millisecond
+	if isPreVote == false {
+		rf.currentTerm++
+		rf.votedFor = rf.me
+		rf.persist()
+	}
+	rf.voteCount = 1
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			args := RequestVoteArgs{
+				Term:         rf.currentTerm,
+				CandidateId:  rf.me,
+				LastLogIndex: rf.log[len(rf.log)-1].Index,
+				LastLogTerm:  rf.log[len(rf.log)-1].Term,
+				IsPreVote:    isPreVote,
+			}
+			reply := RequestVoteReply{}
+			go rf.sendRequestVote(i, &args, &reply)
+		}
+	}
+}
+
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
@@ -806,27 +846,17 @@ func (rf *Raft) ticker() {
 		//fmt.Println(rf.me, rf.state, rf.currentTerm)
 
 		switch rf.state {
-		case follower, candidate:
+		case follower:
 			if time.Since(rf.timeNow) >= rf.timeout {
-				rf.timeNow = time.Now()
-				rf.timeout = time.Duration(250+(rand.Int63()%250)) * time.Millisecond
-				rf.state = candidate
-				rf.votedFor = rf.me
-				rf.voteCount = 1
-				rf.currentTerm++
-				rf.persist()
-				for i, _ := range rf.peers {
-					if i != rf.me {
-						args := RequestVoteArgs{
-							Term:         rf.currentTerm,
-							CandidateId:  rf.me,
-							LastLogIndex: rf.log[len(rf.log)-1].Index,
-							LastLogTerm:  rf.log[len(rf.log)-1].Term,
-						}
-						reply := RequestVoteReply{}
-						go rf.sendRequestVote(i, &args, &reply)
-					}
-				}
+				// Pre Vote
+				// Debug(dVote, "S%d Pre Vote in Term%d", rf.me, rf.currentTerm)
+				rf.vote(true)
+			}
+		case candidate:
+			if time.Since(rf.timeNow) >= rf.timeout {
+				// Formal Vote
+				// Debug(dVote, "S%d Pre Vote in Term%d", rf.me, rf.currentTerm)
+				rf.vote(false)
 			}
 		case leader:
 			if time.Since(rf.timeNow) >= rf.timeout {
